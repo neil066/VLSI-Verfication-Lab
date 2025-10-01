@@ -91,7 +91,8 @@ class verilogFuncs:
                         # Clean the item to find the signal name, which is the last word.
                         # This handles "input [3:0] a", "output b", "c", etc.
                         cleaned_item = re.sub(r"^(input|output|reg|wire)\s+", "", temp_item)
-                        cleaned_item = re.sub(r"\[[^\]]*\]", "", cleaned_item).strip()
+                        # Don't remove array indexing here - we need it for proper signal handling
+                        cleaned_item = cleaned_item.strip()
                         
                         sig = cleaned_item
 
@@ -173,6 +174,7 @@ class verilogFuncs:
                     if m2:
                         mtype, iname, body = m2.group(1), m2.group(2), m2.group(3)
                         if "." in body:  # named connections
+                            # Improved regex to handle more complex signal names and array indexing
                             pairs = re.findall(r"\.(\w+)\s*\(\s*([^)]+)\s*\)", body)
                             conns = [{"port": p, "signal": s.strip()} for p, s in pairs]
                         else:            # positional
@@ -203,24 +205,99 @@ class verilogFuncs:
         if not inp_list:
             return {}
         vals = {}
+        
+        # Expand array inputs into individual bits
+        expanded_inputs = []
+        for inp in inp_list:
+            if "[" in inp and "]" in inp:
+                # This is an array input like "[3:0] a"
+                # Extract the base name and range
+                parts = inp.split()
+                if len(parts) >= 2:
+                    range_part = parts[0]  # "[3:0]"
+                    name_part = parts[1]   # "a"
+                    
+                    # Parse the range [3:0] -> 4 bits
+                    range_match = re.match(r"\[(\d+):(\d+)\]", range_part)
+                    if range_match:
+                        high = int(range_match.group(1))
+                        low = int(range_match.group(2))
+                        bit_count = high - low + 1
+                        
+                        # Add individual bit inputs
+                        for i in range(bit_count):
+                            expanded_inputs.append(f"{name_part}[{i}]")
+                    else:
+                        expanded_inputs.append(inp)
+                else:
+                    expanded_inputs.append(inp)
+            else:
+                expanded_inputs.append(inp)
+        
         choose = input("Load inputs from .txt? (y/n): ").strip().lower()
         if choose.startswith("y"):
             fn = input("file name: ").strip()
             try:
                 bits = re.sub(r"[,\\s]", "", open(fn).read())
-                if len(bits) != len(inp_list):
-                    raise ValueError("bit‑count mismatch")
-                vals = {sig: int(bits[i]) for i, sig in enumerate(inp_list)}
+                if len(bits) != len(expanded_inputs):
+                    raise ValueError(f"bit‑count mismatch: expected {len(expanded_inputs)}, got {len(bits)}")
+                
+                # Map bits to expanded inputs
+                for i, sig in enumerate(expanded_inputs):
+                    vals[sig] = int(bits[i])
+                
+                # Also create the original array values for compatibility
+                for inp in inp_list:
+                    if "[" in inp and "]" in inp:
+                        parts = inp.split()
+                        if len(parts) >= 2:
+                            name_part = parts[1]
+                            range_match = re.match(r"\[(\d+):(\d+)\]", parts[0])
+                            if range_match:
+                                high = int(range_match.group(1))
+                                low = int(range_match.group(2))
+                                bit_count = high - low + 1
+                                
+                                # Reconstruct array value from individual bits
+                                array_val = 0
+                                for i in range(bit_count):
+                                    bit_sig = f"{name_part}[{i}]"
+                                    if bit_sig in vals:
+                                        array_val |= (vals[bit_sig] << i)
+                                vals[name_part] = array_val
+                
                 print("Loaded from file.")
                 return vals
             except Exception as e:
                 print("Error:", e, "— switching to manual entry")
-        print("Enter each input (0/1):")
-        for sig in inp_list:
+        
+        print(f"Enter each input (0/1) - {len(expanded_inputs)} inputs total:")
+        for sig in expanded_inputs:
             v = ""
             while v not in ("0", "1"):
                 v = input(f"{sig}: ").strip()
             vals[sig] = int(v)
+        
+        # Also create the original array values for compatibility
+        for inp in inp_list:
+            if "[" in inp and "]" in inp:
+                parts = inp.split()
+                if len(parts) >= 2:
+                    name_part = parts[1]
+                    range_match = re.match(r"\[(\d+):(\d+)\]", parts[0])
+                    if range_match:
+                        high = int(range_match.group(1))
+                        low = int(range_match.group(2))
+                        bit_count = high - low + 1
+                        
+                        # Reconstruct array value from individual bits
+                        array_val = 0
+                        for i in range(bit_count):
+                            bit_sig = f"{name_part}[{i}]"
+                            if bit_sig in vals:
+                                array_val |= (vals[bit_sig] << i)
+                        vals[name_part] = array_val
+        
         return vals
 
     # ------------------------------------------------------------------ #
@@ -247,7 +324,26 @@ class verilogFuncs:
 
         mod   = mods[name]
         pref  = scope + name + "_"
-        local = {p: in_vals.get(p, 0) for p in mod["inputs"]}
+        local = {}
+        
+        # Initialize local signals with input values
+        for p in mod["inputs"]:
+            local[p] = in_vals.get(p, 0)
+        
+        # Handle array indexing for input signals
+        for sig_name, sig_val in in_vals.items():
+            if isinstance(sig_val, int) and sig_val >= 0:
+                # Extract individual bits for array signals
+                for i in range(4):  # Assuming 4-bit arrays
+                    bit_sig = f"{sig_name}[{i}]"
+                    local[bit_sig] = (sig_val >> i) & 1
+            else:
+                # Handle individual bit signals directly
+                local[sig_name] = sig_val
+        
+        # Also store individual bit signals directly from input values
+        for sig_name, sig_val in in_vals.items():
+            local[sig_name] = sig_val
 
         # recurse into each instance
         for inst in mod["instances"]:
@@ -256,27 +352,55 @@ class verilogFuncs:
             ports        = mods.get(mtype, {}).get("ports", [])
             child_in     = {}
 
+            # Get input/output lists for this module type
+            child_inputs = mods.get(mtype, {}).get("inputs", 
+                         verilogFuncs.primitive_ports.get(mtype, {}).get("inputs", []))
+            child_outputs = mods.get(mtype, {}).get("outputs",
+                          verilogFuncs.primitive_ports.get(mtype, {}).get("outputs", []))
+
             # collect inputs for this child
-            for idx, conn in enumerate(inst["connections"]):
-                role = conn.get("port", ports[idx] if idx < len(ports) else None)
-                if role in mods.get(mtype, {}).get(
-                        "inputs",
-                        verilogFuncs.primitive_ports.get(mtype, {}).get("inputs", [])):
-                    child_in[role] = local.get(conn["signal"], 0)
+            for conn in inst["connections"]:
+                if "port" in conn:  # named connection
+                    role = conn["port"]
+                    signal = conn["signal"]
+                    if role in child_inputs:
+                        # Get the signal value from local scope
+                        signal_val = local.get(signal, 0)
+                        child_in[role] = signal_val
+                        if debug:
+                            print(f"[CONN] {iname}.{role} <- {signal} = {signal_val}")
+                else:  # positional connection
+                    signal = conn["signal"]
+                    # For positional, we need to match by index
+                    conn_idx = inst["connections"].index(conn)
+                    if conn_idx < len(child_inputs):
+                        role = child_inputs[conn_idx]
+                        signal_val = local.get(signal, 0)
+                        child_in[role] = signal_val
+                        if debug:
+                            print(f"[CONN] {iname}.{role} <- {signal} = {signal_val}")
 
             # simulate the child
             verilogFuncs.simulate_module(mods, mtype, child_in, sigs,
                                          inst_scope, debug)
 
             # map child outputs back into our local signals
-            outs = mods.get(mtype, {}).get(
-                "outputs",
-                verilogFuncs.primitive_ports.get(mtype, {}).get("outputs", []))
-            for idx, conn in enumerate(inst["connections"]):
-                role = conn.get("port", ports[idx] if idx < len(ports) else None)
-                if role in outs:
-                    local[conn["signal"]] = sigs.get(
-                        inst_scope + mtype + "_" + role, 0)
+            for conn in inst["connections"]:
+                if "port" in conn:  # named connection
+                    role = conn["port"]
+                    signal = conn["signal"]
+                    if role in child_outputs:
+                        # Get the output value from the child's scope
+                        output_key = inst_scope + mtype + "_" + role
+                        local[signal] = sigs.get(output_key, 0)
+                else:  # positional connection
+                    signal = conn["signal"]
+                    conn_idx = inst["connections"].index(conn)
+                    # For positional, we need to match by index
+                    if conn_idx >= len(child_inputs) and (conn_idx - len(child_inputs)) < len(child_outputs):
+                        role = child_outputs[conn_idx - len(child_inputs)]
+                        output_key = inst_scope + mtype + "_" + role
+                        local[signal] = sigs.get(output_key, 0)
 
         # evaluate assign statements
         for stmt in mod["assigns"]:
@@ -289,6 +413,23 @@ class verilogFuncs:
             sigs[pref + sig] = val
             if debug and sig in mod["outputs"]:
                 print(f"[OUT ] {pref + sig} = {val}")
+        
+        # Also publish module outputs with module name prefix for hierarchical access
+        for output_sig in mod["outputs"]:
+            if output_sig in local:
+                sigs[pref + name + "_" + output_sig] = local[output_sig]
+        
+        # Handle array output reconstruction
+        for output_sig in mod["outputs"]:
+            if "[" in output_sig:  # This is an array output
+                base_name = output_sig.split("[")[0]
+                array_val = 0
+                for i in range(4):  # Assuming 4-bit arrays
+                    bit_sig = f"{base_name}[{i}]"
+                    if bit_sig in local:
+                        array_val |= (local[bit_sig] << i)
+                local[base_name] = array_val
+                sigs[pref + base_name] = array_val
 
     # ------------------------------------------------------------------ #
     #  Simple expression evaluator
@@ -475,10 +616,25 @@ class verilogFuncs:
                 G["nodes"][scope + "OUT_" + p] = {"label": f"{p}={sigs.get(scope+p,'X')}",
                                                  "type": "output"}
 
-        # instance nodes
+        # instance nodes - create detailed nodes for Full Adders
         for inst in mod["instances"]:
-            pretty = f'{inst["instance_name"]} ({inst["module"]})'
-            G["nodes"][scope + inst["instance_name"]] = {"label": pretty, "type": "module"}
+            mtype, iname = inst["module"], inst["instance_name"]
+            nid = scope + iname
+            
+            if mtype == "full_adder":
+                # Create individual port nodes for Full Adder
+                G["nodes"][nid + "_a"] = {"label": f"{iname}.a", "type": "input"}
+                G["nodes"][nid + "_b"] = {"label": f"{iname}.b", "type": "input"}
+                G["nodes"][nid + "_cin"] = {"label": f"{iname}.cin", "type": "input"}
+                G["nodes"][nid + "_sum"] = {"label": f"{iname}.sum", "type": "output"}
+                G["nodes"][nid + "_cout"] = {"label": f"{iname}.cout", "type": "output"}
+                
+                # Create the main FA box
+                G["nodes"][nid] = {"label": f"{iname}\n(FA)", "type": "module"}
+            else:
+                # Regular module node
+                pretty = f'{iname} ({mtype})'
+                G["nodes"][nid] = {"label": pretty, "type": "module"}
 
         # edges into instances
         for inst in mod["instances"]:
@@ -494,7 +650,15 @@ class verilogFuncs:
                 if role in ins:
                     drv = verilogFuncs.find_driver_for_signal(
                         mods, mod, scope, sig, sigs, top, G)
-                    add(drv, nid, f"{sig}={sigs.get(scope+sig,'X')}")
+                    
+                    # For Full Adders, connect to specific port nodes
+                    if mtype == "full_adder":
+                        port_node = nid + "_" + role  # e.g., "FA0_a"
+                        add(drv, port_node, f"{sig}={sigs.get(scope+sig,'X')}")
+                        # Also connect port node to main FA box
+                        add(port_node, nid, "")
+                    else:
+                        add(drv, nid, f"{sig}={sigs.get(scope+sig,'X')}")
 
         # edges out of instances
         for inst in mod["instances"]:
@@ -509,8 +673,17 @@ class verilogFuncs:
                 if role in outs:
                     lds = verilogFuncs.find_loads_for_signal(
                         mods, mod, scope, sig, sigs, top, G)
-                    for ld in lds:
-                        add(nid, ld, f"{sig}={sigs.get(scope+sig,'X')}")
+                    
+                    # For Full Adders, connect from specific port nodes
+                    if mtype == "full_adder":
+                        port_node = nid + "_" + role  # e.g., "FA0_sum"
+                        for ld in lds:
+                            add(port_node, ld, f"{sig}={sigs.get(scope+sig,'X')}")
+                        # Also connect from main FA box to port node
+                        add(nid, port_node, "")
+                    else:
+                        for ld in lds:
+                            add(nid, ld, f"{sig}={sigs.get(scope+sig,'X')}")
 
         # recurse into sub‑instances
         for inst in mod["instances"]:
@@ -627,9 +800,23 @@ class verilogFuncs:
                 shape = "box"
                 extra = ""
                 if attr["type"] == "input":
-                    shape, extra = "circle", "style=filled fillcolor=lightblue"
+                    if "_" in n and ("_a" in n or "_b" in n or "_cin" in n):
+                        # FA input ports - position at top
+                        shape, extra = "circle", "style=filled fillcolor=lightgreen"
+                    else:
+                        # Regular inputs
+                        shape, extra = "circle", "style=filled fillcolor=lightblue"
                 elif attr["type"] == "output":
-                    shape, extra = "doublecircle", "style=filled fillcolor=red"
+                    if "_" in n and ("_sum" in n or "_cout" in n):
+                        # FA output ports - position at bottom
+                        shape, extra = "doublecircle", "style=filled fillcolor=orange"
+                    else:
+                        # Regular outputs
+                        shape, extra = "doublecircle", "style=filled fillcolor=red"
+                elif attr["type"] == "module":
+                    if "FA" in attr["label"]:
+                        # FA boxes - make them more prominent
+                        extra = "style=filled fillcolor=lightgray"
                 f.write(f'  "{n}" [label="{attr["label"]}", shape={shape} {extra}];\n')
 
             f.write("\n")

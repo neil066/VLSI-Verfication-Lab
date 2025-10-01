@@ -56,90 +56,93 @@ def main():
 
     # If a specific gate is requested:
     if gate_instance:
-        # Ask if we should do a local primitive‐only simulation
-        choice = input("Simulate gate locally only? (y/n): ").strip().lower()
-        if choice.startswith("y"):
-            # Find the instance in the top module
-            inst = next((i for i in modules[top_module]['instances']
-                         if i['instance_name'] == gate_instance),
-                        None)
-            if inst is None:
-                print(f"Instance '{gate_instance}' not found in top module '{top_module}'.")
-                sys.exit(1)
+        # Find the instance in the top module
+        inst = next((i for i in modules[top_module]['instances']
+                     if i['instance_name'] == gate_instance),
+                    None)
+        if inst is None:
+            print(f"Instance '{gate_instance}' not found in top module '{top_module}'.")
+            sys.exit(1)
 
-            gate_type = inst['module']
-            if gate_type not in verilogFuncs.primitive_ports:
-                print(f"Gate type '{gate_type}' is not a supported primitive.")
-                sys.exit(1)
+        gate_type = inst['module']
+        
+        # Map hierarchical modules to primitives if needed
+        if gate_type == "full_adder":
+            gate_type = "FA"  # Map full_adder to FA primitive
+        elif gate_type == "half_adder":
+            gate_type = "HA"  # Map half_adder to HA primitive
+            
+        if gate_type not in verilogFuncs.primitive_ports:
+            print(f"Gate type '{gate_type}' is not a supported primitive.")
+            sys.exit(1)
 
-            # Gather its input port names
+        # Ask if they want to simulate gate locally
+        local_only = input("Simulate gate locally only? (y/n): ").strip().lower()
+        
+        if local_only.startswith("n"):
+            # Use values from full circuit simulation
+            input_vals = verilogFuncs.get_input_values(modules[top_module]['inputs'])
+            signal_values = {}
+            verilogFuncs.simulate_module(modules, top_module, input_vals, signal_values, debug=debug)
+            
+            # Get the signal values for this instance
+            in_vals = {}
+            for conn in inst["connections"]:
+                role = conn.get("port")
+                signal = conn["signal"]
+                in_vals[role] = signal_values.get(f"{top_module}_{signal}", 0)
+                
+        else:
+            # Local gate testing: directly ask for gate inputs
             inputs = verilogFuncs.primitive_ports[gate_type]['inputs']
-
-            # Load inputs from file or prompt manually
             load = input("Load gate inputs from .txt? (y/n): ").strip().lower()
             if load.startswith("y"):
-                fn   = input("  file name: ").strip()
+                fn = input("file name: ").strip()
                 bits = re.sub(r"[,\s]", "", open(fn).read())
                 if len(bits) != len(inputs):
-                    print("  ❌ bit-count mismatch (expected "
-                          f"{len(inputs)}, got {len(bits)}), aborting.")
-                    sys.exit(1)
+                    raise ValueError(f"bit-count mismatch (expected {len(inputs)}, got {len(bits)})")
                 in_vals = {p: int(bits[i]) for i, p in enumerate(inputs)}
-                print("  → loaded inputs from file.")
+                print("Loaded from file.")
             else:
                 in_vals = {}
+                print(f"Enter each input (0/1) for {gate_instance}")
                 for p in inputs:
                     v = ""
                     while v not in ("0", "1"):
                         v = input(f"  {p} (0/1)? ").strip()
                     in_vals[p] = int(v)
 
-            # Run the primitive simulation
-            out_vals = verilogFuncs.primitive_simulators[gate_type](in_vals)
+        # Run the primitive simulation with the values
+        out_vals = verilogFuncs.primitive_simulators[gate_type](in_vals)
 
-            # Build port_info: role -> (signal_name, value)
-            port_info = {p: (p, in_vals[p]) for p in inputs}
-            port_info.update({p: (p, v) for p, v in out_vals.items()})
+        # Build port_info for DOT visualization  
+        port_info = {}  # simple basic: create signal -> value mapping for DOT visualization
+        for role in in_vals:
+            port_info[role] = (f"input_{role.lower()}", in_vals[role])
+        for role in out_vals:
+            port_info[role] = (f"output_{role.lower()}", out_vals[role])
 
-            # Generate DOT and PDF
-            dot = f"{gate_instance}_{gate_type}.dot"
-            verilogFuncs.generate_primitive_dot(dot, gate_type, gate_instance, port_info)
-            pdf = f"{gate_instance}_{gate_type}.pdf"
-            print(f"\nConverting {dot} to PDF…")
-            if os.system(f"dot -Tpdf {dot} -o {pdf}") == 0:
-                print(f"✅ Generated '{pdf}'.")
-            else:
-                print("❌ dot → PDF failed; check Graphviz installation.")
-            return
+        print(f"Input values: {in_vals}")
+        print(f"Output values: {out_vals}")
 
-        # Full‐design path, then extract gate
-        input_vals = verilogFuncs.get_input_values(modules[top_module]['inputs'])
-        signal_values = {}
-        verilogFuncs.simulate_module(modules,
-                                     top_module,
-                                     input_vals,
-                                     signal_values,
-                                     debug=debug)
-
-        verilogFuncs.simulate_gate_instance(modules,
-                                            top_module,
-                                            gate_instance,
-                                            signal_values)
-
-        module_type = next((inst['module']
-                            for inst in modules[top_module]['instances']
-                            if inst['instance_name'] == gate_instance),
-                           None)
-        if module_type:
-            dot_file = f"{gate_instance}_{module_type}.dot"
-            pdf_file = f"{gate_instance}_{module_type}.pdf"
-            print(f"\nConverting {dot_file} to PDF…")
-            if os.system(f"dot -Tpdf {dot_file} -o {pdf_file}") == 0:
-                print(f"✅ Generated '{pdf_file}'.")
-            else:
-                print("❌ dot → PDF failed; check Graphviz installation.")
+        # Generate DOT and PDF with proper visual representation
+        dot = f"{gate_instance}_{gate_type}.dot"
+        pdf = f"{gate_instance}_{gate_type}.pdf"
+        
+        # Use specialized layout for different gate types
+        if gate_type == "FA":
+            verilogFuncs.generate_FA_dot(dot, gate_instance, port_info)
+        elif gate_type == "HA":
+            verilogFuncs.generate_HA_dot(dot, gate_instance, port_info)
         else:
-            print(f"Error: Gate instance '{gate_instance}' not found.")
+            verilogFuncs.generate_primitive_dot(dot, gate_type, gate_instance, port_info)
+            
+        print(f"\nConverting {dot} to PDF…")
+        if os.system(f"dot -Tpdf {dot} -o {pdf}") == 0:
+            print(f"✅ Generated '{pdf}'.")
+        else:
+            print("❌ dot → PDF failed; check Graphviz installation.")
+        return
 
     else:
         # No --gate: normal full‐design simulation
